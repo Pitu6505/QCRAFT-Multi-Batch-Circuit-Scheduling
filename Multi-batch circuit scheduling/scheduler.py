@@ -77,7 +77,8 @@ class Scheduler:
         self.app.route('/unscheduler', methods=['POST'])(self.unschedule_route)
         self.app.route('/result', methods=['GET'])(self.sendResults)
 
-        self.result_lock = Lock()   
+        self.result_lock = Lock()
+        self.callback_urls = {}  # Store callback URLs for each user   
 
         # Check if the file with the jobs is not empty, go to each job id and search the data (execute the unscheduler to each one to retrieve the divided results), then delete the job id from the file (do this on a different thread to do job.result() in the case the job has not finished yet)
         Thread(target=self.check_ids).start()
@@ -158,7 +159,7 @@ class Scheduler:
         #        if list(line_dict.keys())[0] not in ids:
         #            file.write(line)        
 
-    def select_policy(self, url:str, num_qubits:int, shots:int, user:int, circuit_name:str, maxDepth:int, provider:str, policy:str, criterio:str) -> None:
+    def select_policy(self, url:str, num_qubits:int, shots:int, user:int, circuit_name:str, maxDepth:int, provider:str, policy:str, criterio:str, callback_url:str = None) -> None:
         """
         Select the policy to execute the circuit and send a post request to the policy service
 
@@ -171,7 +172,11 @@ class Scheduler:
             maxDepth (int): The maximum depth of the circuit            
             provider (str): The provider to execute the circuit            
             policy (str): The policy to execute the circuit
+            callback_url (str, optional): The URL to send results when execution completes
         """
+        if callback_url:
+            with self.result_lock:
+                self.callback_urls[user] = callback_url
         data = {"circuit": url, "num_qubits": num_qubits, "shots": shots, "user": user, "circuit_name": circuit_name, "maxDepth": maxDepth, "provider": provider, "criterio": criterio}
         requests.post(self.policy_service+policy, json=data)
         
@@ -215,6 +220,28 @@ class Scheduler:
                 # Upsert the document
                 # with self.result_lock: #In the case provider is both so the data retrieval is done after the first update finishes
                 #     self.collection.update_one({'_id': str(id), 'circuit': circuit_name}, update, upsert=True)
+                
+                # Send results to callback URL if provided
+                callback_url = None
+                with self.result_lock:
+                    if id in self.callback_urls:
+                        callback_url = self.callback_urls[id]
+                        del self.callback_urls[id]  # Remove after sending
+                
+                if callback_url:
+                    try:
+                        callback_data = {
+                            'user_id': str(id),
+                            'circuit_name': circuit_name,
+                            'results': value,
+                            'shots': shots,
+                            'provider': provider,
+                            'qubits': qb[users.index(id)] if id in users else None
+                        }
+                        requests.post(callback_url, json=callback_data, timeout=10)
+                        print(f"Results sent to callback URL: {callback_url}")
+                    except requests.exceptions.RequestException as e:
+                        print(f"Error sending results to callback URL {callback_url}: {e}")
 
         return "Results stored successfully", 200  # Return a response
 
@@ -230,6 +257,7 @@ class Scheduler:
             shots (int, optional): The number of shots to execute the circuit. Not needed if ibm_shots and aws_shots are specified and both providers are described in `provider`            
             ibm_shots (int, optional): The number of shots to execute the circuit in IBM. Not needed if shots is specified            
             aws_shots (int, optional): The number of shots to execute the circuit in AWS. Not needed if shots is specified
+            callback_url (str, optional): The URL to send results when execution completes
 
         Returns:
             tuple: The response of the policy service with the scheduler task identification
@@ -249,6 +277,7 @@ class Scheduler:
             policy = request.json['policy']     
 
         url =  request.json['url']
+        callback_url = request.json.get('callback_url')  # Optional callback URL
         
         # To handle provider if its a string
         if isinstance(provider, str):
@@ -338,20 +367,21 @@ class Scheduler:
                     except:
                         print("Error in the request to the translator")
                     # TODO instead, parse it into a circuit and transpile it to get the depth (circuit.depth)
-                self.select_policy(url, num_qubits, shots, user, url, maxDepth, provider, policy)
+                self.select_policy(url, num_qubits, shots, user, url, maxDepth, provider, policy, '', callback_url)
     
         return str(user), 200  #return the id
         #return "Your id is "+str(user), 200  # Return a response
     
     def store_url_circuit(self) -> tuple:
         """
-        Sends the GitHub URL of the circuit to the policy service.
+        Sends the URL of the circuit to the policy service.
         It first needs to get the content of the file, check if its a quantum circuit and parse it to a standard way.
 
         Request Parameters:
-            url (str): The GitHub URL of the circuit
+            url (str): The URL of the circuit (any HTTP/HTTPS URL)
             shots (int): The number of shots to execute the circuit
             policy (str): The policy to execute the circuit. Default is 'time'
+            callback_url (str, optional): The URL to send results when execution completes
 
         Returns:
             tuple: The response of the policy service with the scheduler task identification
@@ -368,6 +398,7 @@ class Scheduler:
         url = request.json['url']
         shots = request.json['shots']
         criterio = request.json['criterio']
+        callback_url = request.json.get('callback_url')  # Optional callback URL
 
         if not isinstance(shots, int) or shots <= 0 or shots > 20000:
             return "Invalid shots value", 400
@@ -381,18 +412,18 @@ class Scheduler:
         #with self.result_lock:
         #    self.collection.insert_one(document)
 
-        # URL is a raw GitHub url, get its content
+        # Get the circuit content from the URL
         try:
             parsed_url = urlparse(url)
-            if parsed_url.netloc != "raw.githubusercontent.com":
-                return "URL must come from a raw GitHub file", 400
+            if not parsed_url.scheme in ['http', 'https']:
+                return "URL must use HTTP or HTTPS protocol", 400
             response = requests.get(url)
             response.raise_for_status()
             # Get the name of the file
             circuit_name = url.split('/')[-1]
         except requests.exceptions.RequestException as e:
             print(f"Error getting URL content: {e}")
-            return "Invalid URL", 400
+            return "Invalid URL or unreachable", 400
         
         circuit = response.text
         # Split the circuit string into lines once
@@ -493,7 +524,7 @@ class Scheduler:
             num_qubits = len(qubits.values())
             provider = 'aws'
 
-        self.select_policy(circuit, num_qubits, shots, user, circuit_name, maxDepth, provider, policy, criterio)
+        self.select_policy(circuit, num_qubits, shots, user, circuit_name, maxDepth, provider, policy, criterio, callback_url)
 
         return str(user), 200
 
