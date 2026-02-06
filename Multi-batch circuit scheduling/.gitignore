@@ -1,3 +1,5 @@
 # .gitignore
 __pycache__/
 ids.txt
+venv/
+*.log
