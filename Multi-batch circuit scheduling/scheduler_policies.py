@@ -27,7 +27,7 @@ import subprocess
 
 import sys
 
-CARPETA_SALIDAS = os.path.join("QCRAFT-Scheduler", "QCRAFT-Scheduler", "salidas")
+CARPETA_SALIDAS = os.path.join(os.path.dirname(__file__), "salidas")
 class Policy:
     """
     Class to store the queues and timers of a policy
@@ -96,13 +96,13 @@ class SchedulerPolicies:
         self.iteracion_tiempo = 0
         self.iteracion_ML = 0
         self.app = app
-        self.time_limit_seconds = 600#300 #estaba en 600
+        self.time_limit_seconds = 160
         self.executeCircuitIBM = executeCircuitIBM()
         
         self.setMaxQubits()
-        self.max_qubits = 266 #254 o 266
-        self.max_qubits_send = 133 #127 o 133
-        self.machine_ibm = 'ibm_torino' # ibm_brisbane o ibm_torino
+        self.max_qubits = 312 #254 o 266
+        self.max_qubits_send = 156 #127 o 133
+        self.machine_ibm = 'ibm_fez' # ibm_brisbane o ibm_torino
         self.machine_aws = 'local'
         
 
@@ -186,7 +186,7 @@ class SchedulerPolicies:
         if not self.services[service_name].timers[provider].is_alive():
             self.services[service_name].timers[provider].start()
         n_qubits = sum(item[1] for item in self.services[service_name].queues[provider])
-        if n_qubits >= 254 and (service_name != 'time_maquinas' and service_name != 'MaxML' and service_name != 'MaxPD' and service_name != 'time'): #es 127
+        if n_qubits >= 312 and (service_name != 'time_maquinas' and service_name != 'MaxML' and service_name != 'MaxPD' and service_name != 'time' and service_name != 'multibatch'): #es 127
            self.services[service_name].timers[provider].execute_and_reset()
         return 'Data received', 200
         
@@ -285,8 +285,9 @@ class SchedulerPolicies:
         """
         composition_qubits = 0
         composition_classical_registers = 0
-        max_qb = max(url[1] for url in urls) #Get the maximum number of qubits in the urls
-        total_classical_registers = sum(url[1] for url in urls) #Get the total number of qubits in the urls
+        # urls es batches, cada batch es ([urls_list], sumQb, batch_number)
+        max_qb = max(url[1] for batch in urls for url in batch[0])  # Máximo de qubits por circuito individual
+        total_classical_registers = sum(url[1] for batch in urls for url in batch[0])  # Total de todas las URLs
 
         if provider == 'ibm':
             # Preámbulo para IBM
@@ -308,9 +309,13 @@ class SchedulerPolicies:
 
         for batch_idx, batch in enumerate(urls):
             urls_batch, sumQb, batchNr = batch
-            print("DEBUG urls_batch:", urls_batch)
+            print(f"DEBUG Batch {batch_idx + 1}: {len(urls_batch)} circuitos, {sumQb} qubits")
 
             for url, num_qubits, shots, uid, filename, lineno, flag in urls_batch:
+                # Debug: mostrar los primeros 100 caracteres del código del circuito
+                circuit_preview = url[:100] if isinstance(url, str) else str(url)[:100]
+                print(f"  - Procesando circuito '{filename}': {num_qubits} qubits, código: {circuit_preview}...")
+                
                 if 'algassert' in url:
                     try:
                         x = requests.post(self.translator + provider + '/individual', json={'url': url, 'd': composition_qubits})
@@ -323,6 +328,11 @@ class SchedulerPolicies:
                 else:
                     lines = url.split('\n')
                     for line in lines:
+                        # Skip empty lines and comments
+                        line_stripped = line.strip()
+                        if not line_stripped or line_stripped.startswith('#'):
+                            continue
+                            
                         if provider == 'ibm':
                             line = line.replace('qreg_q[', f'qreg_q[{composition_qubits}+')
                             line = line.replace('creg_c[', f'creg_c[{composition_classical_registers}+')
@@ -358,207 +368,6 @@ class SchedulerPolicies:
 
         code.append("return circuit")
 
-
-    # #POLITICA DE TIEMPO HORIZONTAL
-    # def send(self, queue: list, max_qubits: int, provider: str, executeCircuit: Callable, machine: str) -> None:
-    #     """
-    #     Modificado para garantizar que en cada iteración se ejecute un único circuito compuesto
-    #     (que puede contener hasta 2 batches si hay suficientes circuitos).
-    #     """
-    #     if not queue:
-    #         print("\n✅ No hay más elementos en la cola. Programa finalizado.\n")
-    #         return
-
-    #     if not hasattr(self, "urls_ya_procesados"):
-    #         self.urls_ya_procesados = set()
-
-    #     self.iteracion_tiempo += 1
-    #     colas_sin_criterio = self.obtener_colas_sin_criterio(queue)
-
-    #     file_name = os.path.join(CARPETA_SALIDAS, f"criterio_tiempo.txt")
-    #     elementos_procesados_total = 0
-
-    #     for criterio, cola_original in colas_sin_criterio.items():
-    #         if not cola_original:
-    #             continue
-
-    #         cola = list(cola_original)  # Copia para trabajar
-    #         batches = []
-
-    #         # Generar hasta 2 batches por iteración (si hay suficientes circuitos)
-    #         for batch_num in range(1, 498):  
-    #             urls_batch = []
-    #             sumQb = 0
-
-    #             for url in cola:
-    #                 if url in self.urls_ya_procesados:
-    #                     continue
-    #                 if url[1] + sumQb <= max_qubits:
-    #                     urls_batch.append(url)
-    #                     sumQb += url[1]
-
-    #             if not urls_batch:
-    #                 break  # No hay más circuitos para este batch
-
-    #             batches.append((urls_batch, sumQb, batch_num))
-    #             self.urls_ya_procesados.update(urls_batch)
-
-    #             # Eliminar de la cola principal y la cola del criterio
-    #             for url in urls_batch:
-    #                 if url in queue:
-    #                     queue.remove(url)
-    #                 if url in cola_original:
-    #                     cola_original.remove(url)
-
-    #         # ⚡ Procesar todos los batches juntos en esta iteración
-    #         if batches:
-    #             with open(file_name, "a") as file:
-    #                 file.write(f"\n Iteración {self.iteracion_tiempo} - Máquina: {machine} -- Qubits: {max_qubits}\n")
-    #                 for urls_batch, sumQb, batch_num in batches:
-    #                     file.write(f"  Batch #{batch_num}: [")
-    #                     for url in urls_batch:
-    #                         file.write(f"('{url[4]}', {url[1]} qubits, shots={url[2]}), ")
-    #                     file.write("]\n")
-    #                     file.write(f"    Total qubits usados: {sumQb}\n")
-
-    #             # Construir el circuito único de la iteración
-    #             code, qb = [], []
-    #             shotsUsr = [1000] * sum(len(batch[0]) for batch in batches)  # 1000 fijo por circuito
-    #             self.create_circuit(batches, code, qb, provider)
-
-    #             print(f"///////// EJECUTANDO ITERACIÓN {self.iteracion_tiempo} /////////")
-    #             data = {"code": code}
-
-    #             # ⚠️ Aquí ya no paso urls_batch, sino todos los batches de la iteración
-    #             all_urls = [url for batch in batches for url in batch[0]]
-    #             executeCircuit(json.dumps(data), qb, shotsUsr, provider, all_urls, machine) #AQUI PARA EJECUTAR
-    #             elementos_procesados_total += len(all_urls)
-
-    #     if elementos_procesados_total == 0:
-    #         print(f"\n⚠ Iteración {self.iteracion_tiempo} no generó batches (cola vacía o sin circuitos válidos).")
-    #     else:
-    #         print(f"\n✅ Iteración {self.iteracion_tiempo} completada con {len(batches)} batch(es).")
-    #         print(f"📊 Circuitos procesados en esta iteración: {elementos_procesados_total}")
-    #         print(f"📌 Total acumulado: {len(self.urls_ya_procesados)} circuitos únicos ejecutados.\n")
-
-    
-
-    # POLÍTICA DE TIEMPO HORIZONTAL
-    # POLITICA DE TIEMPO HORIZONTAL
-    # POLITICA DE TIEMPO HORIZONTAL
-    # POLITICA DE TIEMPO HORIZONTAL
-    # POLITICA DE TIEMPO HORIZONTAL
-    # POLITICA DE TIEMPO HORIZONTAL
-    # POLITICA DE TIEMPO HORIZONTAL
-    # def send(self, queue: list, max_qubits: int, provider: str, executeCircuit: Callable, machine: str) -> None:
-    #     """
-    #     Ejecuta batches normalmente, pero cada vez que la suma total de qubits acumulados
-    #     supera 20, ejecuta inmediatamente y continúa con la siguiente tanda.
-    #     """
-    #     if not queue:
-    #         print("\n✅ No hay más elementos en la cola. Programa finalizado.\n")
-    #         return
-
-    #     if not hasattr(self, "urls_ya_procesados"):
-    #         self.urls_ya_procesados = set()
-
-    #     self.iteracion_tiempo += 1
-    #     colas_sin_criterio = self.obtener_colas_sin_criterio(queue)
-
-    #     file_name = os.path.join(CARPETA_SALIDAS, "criterio_tiempo.txt")
-    #     elementos_procesados_total = 0
-
-    #     LIMITE_EJECUCION_QUBITS = 65500  # 🔹 Ejecutar cuando se pase de 20 qubits acumulados
-
-    #     for criterio, cola_original in colas_sin_criterio.items():
-    #         if not cola_original:
-    #             continue
-
-    #         cola = list(cola_original)
-    #         batches = []
-    #         sumQb_total = 0
-    #         batch_counter = 1  # 🔹 Contador que se reiniciará tras cada ejecución
-
-    #         for url in list(cola):  # iteramos sobre copia
-    #             if url in self.urls_ya_procesados:
-    #                 continue
-
-    #             # Intentamos meter el circuito actual en el batch activo o uno nuevo
-    #             if not batches or (batches[-1][1] + url[1]) > max_qubits:
-    #                 # nuevo batch
-    #                 batches.append(([url], url[1], batch_counter))
-    #                 batch_counter += 1
-    #             else:
-    #                 # añadir al último batch
-    #                 batches[-1][0].append(url)
-    #                 batches[-1] = (batches[-1][0], batches[-1][1] + url[1], batches[-1][2])
-
-    #             # marcar procesado
-    #             self.urls_ya_procesados.add(url)
-    #             if url in queue:
-    #                 queue.remove(url)
-    #             if url in cola_original:
-    #                 cola_original.remove(url)
-
-    #             # actualizar suma global
-    #             sumQb_total += url[1]
-
-    #             # ⚡ Si superamos el límite global (20 qubits), ejecutamos inmediatamente
-    #             if sumQb_total >= LIMITE_EJECUCION_QUBITS:
-    #                 with open(file_name, "a") as file:
-    #                     file.write(f"\n Iteración {self.iteracion_tiempo} - Máquina: {machine} -- Límite ejecución: {LIMITE_EJECUCION_QUBITS} qubits\n")
-    #                     for urls_batch, sumQb_b, batch_num_b in batches:
-    #                         file.write(f"  Batch #{batch_num_b}: [")
-    #                         for u in urls_batch:
-    #                             file.write(f"('{u[4]}', {u[1]} qubits, shots={u[2]}), ")
-    #                         file.write("]\n")
-    #                         file.write(f"    Total qubits usados: {sumQb_b}\n")
-
-    #                 # Construir y ejecutar
-    #                 code, qb = [], []
-    #                 shotsUsr = [1000] * sum(len(batch[0]) for batch in batches)
-    #                 self.create_circuit(batches, code, qb, provider)
-
-    #                 print(f"///////// EJECUTANDO ITERACIÓN {self.iteracion_tiempo} /////////")
-    #                 data = {"code": code}
-    #                 all_urls = [u for batch in batches for u in batch[0]]
-
-    #                 #executeCircuit(json.dumps(data), qb, shotsUsr, provider, all_urls, machine)
-    #                 elementos_procesados_total += len(all_urls)
-
-    #                 # 🔁 Reiniciamos para siguiente ejecución
-    #                 self.iteracion_tiempo += 1
-    #                 batches = []
-    #                 sumQb_total = 0
-    #                 batch_counter = 1  # Reinicia numeración de batches
-
-    #         # ⚠ Si quedaron circuitos sin llegar a los 20 qubits finales, ejecutar esos también
-    #         if batches:
-    #             with open(file_name, "a") as file:
-    #                 file.write(f"\n Iteración {self.iteracion_tiempo} - Máquina: {machine} -- Ejecución final parcial\n")
-    #                 for urls_batch, sumQb_b, batch_num_b in batches:
-    #                     file.write(f"  Batch #{batch_num_b}: [")
-    #                     for u in urls_batch:
-    #                         file.write(f"('{u[4]}', {u[1]} qubits, shots={u[2]}), ")
-    #                     file.write("]\n")
-    #                     file.write(f"    Total qubits usados: {sumQb_b}\n")
-
-    #             code, qb = [], []
-    #             shotsUsr = [1000] * sum(len(batch[0]) for batch in batches)
-    #             self.create_circuit(batches, code, qb, provider)
-
-    #             print(f"///////// EJECUTANDO ITERACIÓN FINAL {self.iteracion_tiempo} /////////")
-    #             data = {"code": code}
-    #             all_urls = [u for batch in batches for u in batch[0]]
-
-    #             executeCircuit(json.dumps(data), qb, shotsUsr, provider, all_urls, machine)
-    #             elementos_procesados_total += len(all_urls)
-
-    #     if elementos_procesados_total == 0:
-    #         print(f"\n⚠ Iteración {self.iteracion_tiempo} no generó batches (cola vacía o sin circuitos válidos).")
-    #     else:
-    #         print(f"\n✅ Iteraciones completadas. Circuitos totales procesados: {elementos_procesados_total}")
-    #         print(f"📌 Total acumulado: {len(self.urls_ya_procesados)} circuitos únicos ejecutados.\n")
 
 
 
@@ -707,30 +516,6 @@ class SchedulerPolicies:
             print(f"\n✅ Iteraciones completadas. Circuitos totales procesados: {elementos_procesados_total}")
             print(f"📌 Total acumulado: {len(self.urls_ya_procesados)} circuitos únicos ejecutados.\n")
 
-
-
-
-
-        
-    # def encontrar_mejor_batch(self, cola, max_qubits):
-    #     mejor_batch = []
-    #     mejor_suma = 0
-    #     vistos = set()
-
-    #     for r in range(1, len(cola) + 1):
-    #         for combo in combinations(cola, r):
-    #             ids = tuple(sorted(id(x) for x in combo))
-    #             if ids in vistos:
-    #                 continue
-    #             vistos.add(ids)
-
-    #             total = sum(x[1] for x in combo)
-    #             if total <= max_qubits and total > mejor_suma:
-    #                 mejor_batch = list(combo)
-    #                 mejor_suma = total
-    #                 if mejor_suma == max_qubits:
-    #                     return mejor_batch
-    #     return mejor_batch
 
 
     def send_shots_optimized(self,queue:list, max_qubits:int, provider:str, executeCircuit:Callable, machine:str) -> None:
@@ -1149,69 +934,6 @@ class SchedulerPolicies:
         }
 
         return colas_sin_criterio
-    #   NO SIRVE PARA LAS PRUEBAS
-    # def obtener_mejor_maquina(self, capacidad_maxima, criterio):
-    #     # dispositivos_ibm = self.obtener_dispositivos_ibm()
-    #     # dispositivos_aws = self.obtener_dispositivos_aws()
-    #     # dispositivos = dispositivos_ibm + dispositivos_aws
-        
-    #     # if not dispositivos:
-    #     #     print("No se encontraron dispositivos disponibles.")
-    #     #     return None
-
-    #     # dispositivos_online = [d for d in dispositivos if d.get("deviceStatus") == "ONLINE"]
-    #     # if not dispositivos_online:
-    #     #     print("\n⚠ No hay máquinas en línea disponibles.")
-    #     #     return None
-        
-    #     # max_qubit_maquinas = max(d["qubitCount"] for d in dispositivos_online)
-    #     # print(f"\n🔹 La máxima capacidad de las máquinas es: {max_qubit_maquinas}")
-
-    #     dispositivos_online = self.dispositivos_disponibles
-    #     max_qubit_maquinas = max(d["qubitCount"] for d in dispositivos_online)
-    #     print(f"\n🔹 La máxima capacidad de las máquinas es: {max_qubit_maquinas}")
-        
-    #     # Filtrar máquinas con qubitCount mayor al máximo número en la cola
-    #     maquinas_validas = [d for d in dispositivos_online if d["qubitCount"] > capacidad_maxima]
-        
-        
-    #     if not maquinas_validas:
-    #         print("⚠ No hay máquinas con suficiente capacidad.")
-    #         return None
-        
-    #     if capacidad_maxima == max_qubit_maquinas:
-    #         maquinas_validas = [d for d in dispositivos_online if d["qubitCount"] == max_qubit_maquinas]
-
-    #     if criterio == 1:
-    #         mejor_maquina = min(maquinas_validas, key=lambda d: (d["queueSize"], -d["qubitCount"]))
-    #     elif criterio == 2:
-    #         mejor_maquina = max(maquinas_validas, key=lambda d: (d["qubitCount"], -d["queueSize"]))
-    #     elif criterio == 3:
-    #         peso_capacidad = 50
-    #         peso_cola = 50
-    #         min_qubits = min(d["qubitCount"] for d in maquinas_validas)
-    #         max_qubits = max(d["qubitCount"] for d in maquinas_validas)
-    #         min_queue = min(d["queueSize"] for d in maquinas_validas)
-    #         max_queue = max(d["queueSize"] for d in maquinas_validas)
-            
-    #         def normalizar(valor, minimo, maximo):
-    #             return (valor - minimo) / (maximo - minimo) if maximo > minimo else 1
-            
-    #         def calcular_puntuacion(dispositivo):
-    #             score_qubits = normalizar(dispositivo["qubitCount"], min_qubits, max_qubits)
-    #             score_queue = 1 - normalizar(dispositivo["queueSize"], min_queue, max_queue)
-    #             return (peso_capacidad / 100 * score_qubits) + (peso_cola / 100 * score_queue)
-            
-    #         ranking = sorted(maquinas_validas, key=calcular_puntuacion, reverse=True)
-    #         mejor_maquina = ranking[0]
-    #     else:
-    #         print("⚠ Criterio no válido.")
-    #         return None
-        
-        
-        
-    #     print(f"\n🏆 Máquina seleccionada para el criterio {criterio}: {mejor_maquina['deviceName']} ({mejor_maquina['providerName']})")
-    #     return mejor_maquina
 
 
     def obtener_mejor_maquina(self, suma_total_qubits, capacidad_maxima, politica, criterio):

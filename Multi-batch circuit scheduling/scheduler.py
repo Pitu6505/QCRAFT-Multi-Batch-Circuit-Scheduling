@@ -349,25 +349,30 @@ class Scheduler:
 
             for provider in providers: #Iterate through the providers to add the elements to the specific provider queue in case the circuit needs to be executed on multiple providers
                 shots = providers[provider]
-                if self.transpilation_machine == 'local':
-                    maxDepth = max(sum(1 for j in circuit['cols'] if i < len(j) and j[i] not in {1, 'Measure'}) for i in range(num_qubits))
-                else:
-                    try:
-                        x = requests.post(self.translator+provider, json = {'url':url})
-                        data = json.loads(x.text)                        
-                        code = ""
-                        for elem in data['code']:
-                            code += elem + '\n'
+                code = ""  # Initialize code variable
+                try:
+                    # Always translate the URL to get the circuit code
+                    x = requests.post(self.translator+provider, json = {'url':url})
+                    data = json.loads(x.text)                        
+                    for elem in data['code']:
+                        code += elem + '\n'
+                    
+                    if self.transpilation_machine == 'local':
+                        maxDepth = max(sum(1 for j in circuit['cols'] if i < len(j) and j[i] not in {1, 'Measure'}) for i in range(num_qubits))
+                    else:
                         if provider == 'ibm':
                             circ = self.executeCircuitIBM.code_to_circuit_ibm(code) #check this method because if a lot of circuits enter at the same time, it fails
                             maxDepth = self.executeCircuitIBM.get_transpiled_circuit_depth_ibm(circ, self.transpilation_backend)
                         elif provider == 'aws':
                             #TODO
                             maxDepth = max(sum(1 for j in circuit['cols'] if i < len(j) and j[i] not in {1, 'Measure'}) for i in range(num_qubits))
-                    except:
-                        print("Error in the request to the translator")
-                    # TODO instead, parse it into a circuit and transpile it to get the depth (circuit.depth)
-                self.select_policy(url, num_qubits, shots, user, url, maxDepth, provider, policy, '', callback_url)
+                except Exception as e:
+                    print(f"Error in the request to the translator: {e}")
+                    code = url  # Fallback to URL if translation fails
+                    maxDepth = 1
+                # TODO instead, parse it into a circuit and transpile it to get the depth (circuit.depth)
+                # Pass the translated CODE, not the URL
+                self.select_policy(code, num_qubits, shots, user, url, maxDepth, provider, policy, '', callback_url)
     
         return str(user), 200  #return the id
         #return "Your id is "+str(user), 200  # Return a response
@@ -432,11 +437,54 @@ class Scheduler:
         importIBM = next((line for line in lines if 'qiskit' in line), None)
 
         if importIBM:
-            circ = self.executeCircuitIBM.code_to_circuit_ibm(circuit)
             # Parse the circuit and extract the number of qubits
+            num_qubits = None
+            
+            # Check if circuit is loaded from QASM (qasm2.loads or similar)
+            is_qasm_loaded = any('qasm2.loads' in line or 'qasm3.loads' in line for line in lines)
+            
+            if is_qasm_loaded:
+                # Extract QASM code from the string
+                # Find the QASM string between triple quotes
+                qasm_start = circuit.find('"""')
+                if qasm_start != -1:
+                    qasm_end = circuit.find('"""', qasm_start + 3)
+                    if qasm_end != -1:
+                        qasm_code = circuit[qasm_start + 3:qasm_end]
+                        # Load the circuit from QASM
+                        from qiskit import qasm2
+                        circ = qasm2.loads(qasm_code)
+                    else:
+                        return "Invalid QASM code format", 400
+                else:
+                    return "QASM code not found", 400
+            else:
+                # Traditional circuit construction
+                circ = self.executeCircuitIBM.code_to_circuit_ibm(circuit)
+            
+            # Try to find QuantumRegister definition
             num_qubits_line = next((line.split('#')[0].strip() for line in lines if '= QuantumRegister(' in line.split('#')[0]), None)
-            num_qubits = int(num_qubits_line.split('QuantumRegister(')[1].split(',')[0].strip(')')) if num_qubits_line else None
-
+            if num_qubits_line:
+                num_qubits = int(num_qubits_line.split('QuantumRegister(')[1].split(',')[0].strip(')'))
+            
+            # If not found, try to find qreg in QASM code (for qasm2.loads cases)
+            if num_qubits is None:
+                qreg_match = next((line for line in lines if 'qreg' in line and '[' in line), None)
+                if qreg_match:
+                    num_qubits = int(re.search(r'qreg\s+\w+\[(\d+)\]', qreg_match).group(1))
+            
+            # If still not found, try to extract from QuantumCircuit() direct instantiation
+            if num_qubits is None:
+                qc_line = next((line.split('#')[0].strip() for line in lines if '= QuantumCircuit(' in line.split('#')[0]), None)
+                if qc_line and 'QuantumCircuit(' in qc_line:
+                    match = re.search(r'QuantumCircuit\((\d+)', qc_line)
+                    if match:
+                        num_qubits = int(match.group(1))
+            
+            # If still None, get from the circuit object itself
+            if num_qubits is None:
+                num_qubits = circ.num_qubits
+            
             if num_qubits > self.scheduler_policies.getMaxQubits():
                 return "Circuit too large", 400
 
@@ -444,37 +492,51 @@ class Scheduler:
             file_circuit_name_line = next((line.split('#')[0].strip() for line in lines if '= QuantumCircuit(' in line.split('#')[0]), None)
             file_circuit_name = file_circuit_name_line.split('=')[0].strip() if file_circuit_name_line else None
 
-            # Get the name of the quantum register
-            qreg_line = next((line.split('#')[0].strip() for line in lines if '= QuantumRegister(' in line.split('#')[0]), None)
-            qreg = qreg_line.split('=')[0].strip() if qreg_line else None
-            # Get the name of the classical register
-            creg_line = next((line.split('#')[0].strip() for line in lines if '= ClassicalRegister(' in line.split('#')[0]), None)
-            creg = creg_line.split('=')[0].strip() if creg_line else None
+            # Check if circuit is loaded from QASM (qasm2.loads or similar)
+            is_qasm_loaded = any('qasm2.loads' in line or 'qasm3.loads' in line for line in lines)
 
+            if file_circuit_name and not is_qasm_loaded:
+                # Traditional circuit construction with gate operations
+                # Get the name of the quantum register
+                qreg_line = next((line.split('#')[0].strip() for line in lines if '= QuantumRegister(' in line.split('#')[0]), None)
+                qreg = qreg_line.split('=')[0].strip() if qreg_line else None
+                # Get the name of the classical register
+                creg_line = next((line.split('#')[0].strip() for line in lines if '= ClassicalRegister(' in line.split('#')[0]), None)
+                creg = creg_line.split('=')[0].strip() if creg_line else None
 
-            # Remove all lines that don't start with file_circuit_name and don't include the line that has file_circuit_name.add_register and line not starts with // or # (comments)
-            circuit_lines = [line.split('#')[0].strip() for line in lines if line.split('#')[0].strip().startswith(file_circuit_name+'.') and 'add_register' not in line]
-            circuit = '\n'.join(circuit_lines)
-            
-            
-            # Replace all appearances of file_circuit_name, qreg, and creg
-            circuit = circuit.replace(file_circuit_name+'.', 'circuit.')
-            circuit = circuit.replace(f'{qreg}[', 'qreg_q[')
-            circuit = circuit.replace(f'{creg}[', 'creg_c[')
+                # Remove all lines that don't start with file_circuit_name and don't include the line that has file_circuit_name.add_register and line not starts with // or # (comments)
+                circuit_lines = [line.split('#')[0].strip() for line in lines if line.split('#')[0].strip().startswith(file_circuit_name+'.') and 'add_register' not in line]
+                circuit = '\n'.join(circuit_lines)
+                
+                # Replace all appearances of file_circuit_name, qreg, and creg
+                circuit = circuit.replace(file_circuit_name+'.', 'circuit.')
+                circuit = circuit.replace(f'{qreg}[', 'qreg_q[')
+                circuit = circuit.replace(f'{creg}[', 'creg_c[')
 
-            # Create an array with the same length as the number of qubits initialized to 0 to count the number of gates on each qubit
-            qubits = [0] * num_qubits
-            for line in circuit.split('\n'): # For each line in the circuit
-                if 'measure' not in line and 'barrier' not in line: #If the line is not a measure or a barrier
-                    # Check the numbers after qreg_q and add 1 to qubits on that position. It should work with whings like circuit.cx(qreg_q[0], qreg_q[3]), adding 1 to both 0 and 3
-                    # This adds 1 to the number of gates used on that qubit
-                    for match in re.finditer(r'qreg_q\[(\d+)\]', line):
-                        qubits[int(match.group(1))] += 1
-            if self.transpilation_machine == 'local':   
-                maxDepth = max(qubits) #Get the max number of gates on a qubit
+                # Create an array with the same length as the number of qubits initialized to 0 to count the number of gates on each qubit
+                qubits = [0] * num_qubits
+                for line in circuit.split('\n'): # For each line in the circuit
+                    if 'measure' not in line and 'barrier' not in line: #If the line is not a measure or a barrier
+                        # Check the numbers after qreg_q and add 1 to qubits on that position. It should work with whings like circuit.cx(qreg_q[0], qreg_q[3]), adding 1 to both 0 and 3
+                        # This adds 1 to the number of gates used on that qubit
+                        for match in re.finditer(r'qreg_q\[(\d+)\]', line):
+                            qubits[int(match.group(1))] += 1
+                if self.transpilation_machine == 'local':   
+                    maxDepth = max(qubits) if qubits else 0 #Get the max number of gates on a qubit
+                else:
+                    #maxDepth = self.executeCircuitIBM.get_transpiled_circuit_depth_ibm(circ, self.transpilation_backend)
+                    maxDepth = 1
             else:
-                #maxDepth = self.executeCircuitIBM.get_transpiled_circuit_depth_ibm(circ, self.transpilation_backend)
-                maxDepth = 1
+                # Circuit loaded from QASM or no standard circuit variable found
+                # Use the circuit object's depth directly
+                if self.transpilation_machine == 'local':
+                    maxDepth = circ.depth()
+                else:
+                    maxDepth = self.executeCircuitIBM.get_transpiled_circuit_depth_ibm(circ, self.transpilation_backend)
+                
+                # The circuit content is the original QASM or full code
+                # No need to process individual gate lines
+            
             provider = 'ibm'
         
         elif importAWS:
