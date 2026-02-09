@@ -28,6 +28,7 @@ import subprocess
 import sys
 
 CARPETA_SALIDAS = os.path.join(os.path.dirname(__file__), "salidas")
+CARPETA_CIRCUITOS = os.path.join(CARPETA_SALIDAS, "circuitos")
 class Policy:
     """
     Class to store the queues and timers of a policy
@@ -243,6 +244,7 @@ class SchedulerPolicies:
                 counts = runAWS_save(machine,loc['circuit'],max(shots),[url[3] for url in urls],qb,[url[4] for url in urls],'') #Ejecutar el circuito y obtener el resultado
         except Exception as e:
             print(f"Error executing circuit: {e}")
+            counts = {}
 
         #print(counts.items())
 
@@ -288,12 +290,13 @@ class SchedulerPolicies:
         # urls es batches, cada batch es ([urls_list], sumQb, batch_number)
         max_qb = max(url[1] for batch in urls for url in batch[0])  # Máximo de qubits por circuito individual
         total_classical_registers = sum(url[1] for batch in urls for url in batch[0])  # Total de todas las URLs
+        max_batch_qubits = max(batch[1] for batch in urls) if urls else 0
 
         if provider == 'ibm':
             # Preámbulo para IBM
             code.insert(0, "circuit = QuantumCircuit(qreg_q, creg_c)")
             code.insert(0, f"creg_c = ClassicalRegister({total_classical_registers}, 'c')")
-            code.insert(0, f"qreg_q = QuantumRegister({max_qb}, 'q')")
+            code.insert(0, f"qreg_q = QuantumRegister({max_batch_qubits}, 'q')")
             code.insert(0, "from numpy import pi")
             code.insert(0, "import numpy as np")
             code.insert(0, "from qiskit import QuantumRegister, ClassicalRegister, QuantumCircuit")
@@ -306,6 +309,64 @@ class SchedulerPolicies:
             code.insert(0, "import numpy as np")
             code.insert(0, "from collections import Counter")
             code.insert(0, "from braket.circuits import Circuit")
+
+        def append_qasm_block(qasm_text: str, q_offset: int, c_offset: int) -> None:
+            qreg_name = None
+            creg_name = None
+            for raw in qasm_text.split('\n'):
+                line = raw.strip()
+                if not line or line.startswith('//'):
+                    continue
+                if line.startswith('qreg '):
+                    qreg_name = line.split()[1].split('[')[0]
+                    continue
+                if line.startswith('creg '):
+                    creg_name = line.split()[1].split('[')[0]
+                    continue
+                if line.startswith('OPENQASM') or line.startswith('include'):
+                    continue
+
+                if line.startswith('measure '):
+                    m = re.match(r'measure\s+(\w+)\[(\d+)\]\s*->\s*(\w+)\[(\d+)\];', line)
+                    if m and m.group(1) == qreg_name and m.group(3) == creg_name:
+                        q_idx = int(m.group(2))
+                        c_idx = int(m.group(4))
+                        code.append(f"circuit.measure(qreg_q[{q_offset}+{q_idx}], creg_c[{c_offset}+{c_idx}])")
+                    continue
+
+                gate = re.match(r'(\w+)(?:\(([^)]*)\))?\s+(\w+)\[(\d+)\](?:,\s*(\w+)\[(\d+)\])?;', line)
+                if not gate or gate.group(3) != qreg_name:
+                    continue
+
+                gate_name = gate.group(1)
+                params = gate.group(2)
+                q0 = int(gate.group(4))
+                q1 = int(gate.group(6)) if gate.group(6) is not None else None
+
+                param_list = []
+                if params:
+                    for param in params.split(','):
+                        token = param.strip()
+                        token = re.sub(r'\bpi\b', 'np.pi', token)
+                        if token:
+                            param_list.append(token)
+
+                if q1 is None:
+                    if param_list:
+                        code.append(
+                            f"circuit.{gate_name}({', '.join(param_list)}, qreg_q[{q_offset}+{q0}])"
+                        )
+                    else:
+                        code.append(f"circuit.{gate_name}(qreg_q[{q_offset}+{q0}])")
+                else:
+                    if param_list:
+                        code.append(
+                            f"circuit.{gate_name}({', '.join(param_list)}, qreg_q[{q_offset}+{q0}], qreg_q[{q_offset}+{q1}])"
+                        )
+                    else:
+                        code.append(
+                            f"circuit.{gate_name}(qreg_q[{q_offset}+{q0}], qreg_q[{q_offset}+{q1}])"
+                        )
 
         for batch_idx, batch in enumerate(urls):
             urls_batch, sumQb, batchNr = batch
@@ -325,12 +386,22 @@ class SchedulerPolicies:
                     except Exception as e:
                         print(f"Error translating circuit {url}: {e}")
                         continue
+                elif provider == 'ibm' and ('OPENQASM' in url or 'qasm_data' in url):
+                    qasm_blocks = re.findall(r'"""(OPENQASM[\s\S]*?)"""', url)
+                    if qasm_blocks:
+                        append_qasm_block(qasm_blocks[0], composition_qubits, composition_classical_registers)
+                    else:
+                        qasm_start = url.find('OPENQASM')
+                        if qasm_start != -1:
+                            append_qasm_block(url[qasm_start:], composition_qubits, composition_classical_registers)
                 else:
                     lines = url.split('\n')
                     for line in lines:
                         # Skip empty lines and comments
                         line_stripped = line.strip()
                         if not line_stripped or line_stripped.startswith('#'):
+                            continue
+                        if provider == 'ibm' and not line_stripped.startswith('circuit.'):
                             continue
                             
                         if provider == 'ibm':
@@ -401,9 +472,11 @@ class SchedulerPolicies:
 
         # 🔹 Archivo criterio_tiempo sigue en CARPETA_SALIDAS
         file_name = os.path.join(CARPETA_SALIDAS, "criterio_tiempo.txt")
+        os.makedirs(CARPETA_CIRCUITOS, exist_ok=True)
 
         elementos_procesados_total = 0
         LIMITE_EJECUCION_QUBITS = 70000
+        save_idx = 1
 
         # 🔹 Reinicia el archivo info.txt solo la primera vez
         if self.iteracion_tiempo == 1:
@@ -478,6 +551,14 @@ class SchedulerPolicies:
                     data = {"code": code}
                     all_urls = [u for batch in batches for u in batch[0]]
 
+                    archivo_circuito = os.path.join(
+                        CARPETA_CIRCUITOS,
+                        f"iter_{self.iteracion_tiempo}_lote_{save_idx}_{provider}_{machine}.txt",
+                    )
+                    with open(archivo_circuito, "w") as out_file:
+                        out_file.write("\n".join(code))
+                    save_idx += 1
+
                     executeCircuit(json.dumps(data), qb, shotsUsr, provider, all_urls, machine)
                     elementos_procesados_total += len(all_urls)
 
@@ -506,6 +587,14 @@ class SchedulerPolicies:
                 print(f"///////// EJECUTANDO ITERACIÓN FINAL {self.iteracion_tiempo} /////////")
                 data = {"code": code}
                 all_urls = [u for batch in batches for u in batch[0]]
+
+                archivo_circuito = os.path.join(
+                    CARPETA_CIRCUITOS,
+                    f"iter_{self.iteracion_tiempo}_final_{save_idx}_{provider}_{machine}.txt",
+                )
+                with open(archivo_circuito, "w") as out_file:
+                    out_file.write("\n".join(code))
+                save_idx += 1
 
                 executeCircuit(json.dumps(data), qb, shotsUsr, provider, all_urls, machine)
                 elementos_procesados_total += len(all_urls)
